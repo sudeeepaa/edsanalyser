@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -16,6 +19,7 @@ type LighthouseRunner interface {
 
 type CLILighthouseRunner struct {
 	Timeout time.Duration
+	TempDir string
 }
 
 func NewCLILighthouseRunner(timeout time.Duration) CLILighthouseRunner {
@@ -25,6 +29,17 @@ func NewCLILighthouseRunner(timeout time.Duration) CLILighthouseRunner {
 func (r CLILighthouseRunner) Audit(ctx context.Context, pageURL string) (ScoreSet, error) {
 	if r.Timeout <= 0 {
 		r.Timeout = 90 * time.Second
+	}
+	tempDir := r.TempDir
+	if tempDir == "" {
+		tempDir = filepath.Join(".data", "lighthouse-temp")
+	}
+	absoluteTempDir, err := filepath.Abs(tempDir)
+	if err != nil {
+		absoluteTempDir = tempDir
+	}
+	if err := os.MkdirAll(absoluteTempDir, 0o755); err != nil {
+		return ScoreSet{}, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, r.Timeout)
 	defer cancel()
@@ -44,6 +59,7 @@ func (r CLILighthouseRunner) Audit(ctx context.Context, pageURL string) (ScoreSe
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	cmd.Env = lighthouseEnv(absoluteTempDir)
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
 			return ScoreSet{}, ctx.Err()
@@ -51,6 +67,32 @@ func (r CLILighthouseRunner) Audit(ctx context.Context, pageURL string) (ScoreSe
 		return ScoreSet{}, fmt.Errorf("lighthouse failed: %w: %s", err, stderr.String())
 	}
 	return ParseLighthouseScores(stdout.Bytes())
+}
+
+func lighthouseEnv(tempDir string) []string {
+	env := os.Environ()
+	seen := map[string]bool{}
+	sanitized := make([]string, 0, len(env)+5)
+	for _, entry := range env {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		normalized := strings.ToUpper(key)
+		if seen[normalized] {
+			continue
+		}
+		seen[normalized] = true
+		sanitized = append(sanitized, entry)
+	}
+	sanitized = append(sanitized,
+		"TEMP="+tempDir,
+		"TMP="+tempDir,
+		"TMPDIR="+tempDir,
+		"CHROME_CONFIG_HOME="+filepath.Join(tempDir, "chrome-config"),
+		"XDG_CACHE_HOME="+filepath.Join(tempDir, "cache"),
+	)
+	return sanitized
 }
 
 func ParseLighthouseScores(body []byte) (ScoreSet, error) {

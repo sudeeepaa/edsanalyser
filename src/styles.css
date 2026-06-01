@@ -236,6 +236,34 @@ h3 {
   background: #eef2f0;
 }
 
+.audit-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: #eef2f0;
+  color: #68736e;
+  font-size: 0.82rem;
+  font-weight: 700;
+  text-transform: capitalize;
+}
+
+.audit-status.running {
+  color: #855900;
+  background: #fff2cb;
+}
+
+.audit-status.complete {
+  color: #14543a;
+  background: #ddf3e7;
+}
+
+.audit-status.failed {
+  color: #8f2222;
+  background: #ffe1df;
+}
+
 .progress-band {
   display: grid;
   grid-template-columns: repeat(5, minmax(120px, 1fr));
@@ -308,6 +336,21 @@ h3 {
   align-items: center;
   gap: 12px;
   margin-bottom: 14px;
+}
+
+.panel-note,
+.muted-text,
+.empty-cell {
+  color: #65716b;
+}
+
+.panel-note {
+  margin-bottom: 14px;
+  font-size: 0.9rem;
+}
+
+.empty-cell {
+  text-align: center;
 }
 
 .score-grid,
@@ -560,4 +603,3 @@ dd {
     grid-template-columns: 1fr;
   }
 }
-

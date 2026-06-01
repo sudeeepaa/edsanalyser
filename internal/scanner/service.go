@@ -20,6 +20,19 @@ type ServiceOptions struct {
 	Workers    int
 }
 
+type ScanOptions struct {
+	CrawlLimit      *int
+	LighthouseMode  string
+	LighthouseLimit int
+}
+
+func DefaultScanOptions() ScanOptions {
+	return ScanOptions{
+		LighthouseMode:  "top",
+		LighthouseLimit: 5,
+	}
+}
+
 type Service struct {
 	store      Store
 	client     *http.Client
@@ -54,13 +67,19 @@ func NewService(store Store, opts ServiceOptions) *Service {
 	}
 }
 
-func (s *Service) StartScan(parent context.Context, inputURL string, auditLimit *int) (ScanSummary, error) {
+func (s *Service) StartScan(parent context.Context, inputURL string, opts ScanOptions) (ScanSummary, error) {
 	root, err := NormalizeInputURL(inputURL)
 	if err != nil {
 		return ScanSummary{}, err
 	}
-	if auditLimit != nil && *auditLimit <= 0 {
-		auditLimit = nil
+	if opts.CrawlLimit != nil && *opts.CrawlLimit <= 0 {
+		opts.CrawlLimit = nil
+	}
+	if opts.LighthouseMode == "" {
+		opts.LighthouseMode = "top"
+	}
+	if opts.LighthouseLimit <= 0 {
+		opts.LighthouseLimit = 5
 	}
 
 	id := newID()
@@ -70,6 +89,7 @@ func (s *Service) StartScan(parent context.Context, inputURL string, auditLimit 
 		InputURL:  inputURL,
 		RootURL:   root.String(),
 		Status:    "running",
+		Phase:     "discovering",
 		StartedAt: time.Now(),
 	}
 	if err := s.store.CreateScan(scan); err != nil {
@@ -81,7 +101,7 @@ func (s *Service) StartScan(parent context.Context, inputURL string, auditLimit 
 	s.cancels[id] = cancel
 	s.mu.Unlock()
 
-	go s.runScan(ctx, scan, root, auditLimit)
+	go s.runScan(ctx, scan, root, opts)
 	return scan, parent.Err()
 }
 
@@ -125,7 +145,7 @@ func (s *Service) Subscribe(scanID string) (<-chan Event, func()) {
 	return ch, cancel
 }
 
-func (s *Service) runScan(ctx context.Context, scan ScanSummary, root *url.URL, auditLimit *int) {
+func (s *Service) runScan(ctx context.Context, scan ScanSummary, root *url.URL, opts ScanOptions) {
 	defer func() {
 		s.mu.Lock()
 		delete(s.cancels, scan.ID)
@@ -146,8 +166,8 @@ func (s *Service) runScan(ctx context.Context, scan ScanSummary, root *url.URL, 
 	seen := map[string]bool{}
 	var queue []string
 	limit := 0
-	if auditLimit != nil {
-		limit = *auditLimit
+	if opts.CrawlLimit != nil {
+		limit = *opts.CrawlLimit
 	}
 	enqueue := func(raw string) {
 		if limit > 0 && len(seen) >= limit {
@@ -169,6 +189,8 @@ func (s *Service) runScan(ctx context.Context, scan ScanSummary, root *url.URL, 
 	for _, seed := range seeds {
 		enqueue(seed)
 	}
+	scan.Phase = "analyzing"
+	_ = s.store.UpdateScan(scan)
 	s.publish(Event{Type: "discovered", ScanID: scan.ID, Message: fmt.Sprintf("%d pages queued", len(queue)), Data: scan})
 
 	jobs := make(chan string)
@@ -176,7 +198,7 @@ func (s *Service) runScan(ctx context.Context, scan ScanSummary, root *url.URL, 
 	for i := 0; i < s.workers; i++ {
 		go func() {
 			for pageURL := range jobs {
-				page := s.processPage(ctx, pageURL, root)
+				page := s.fetchAndAnalyzePage(ctx, pageURL, root)
 				select {
 				case results <- page:
 				case <-ctx.Done():
@@ -186,15 +208,11 @@ func (s *Service) runScan(ctx context.Context, scan ScanSummary, root *url.URL, 
 		}()
 	}
 
-	rollup := newScoreRollup()
 	inFlight := 0
+	analyzedPages := []PageResult{}
 	for len(queue) > 0 || inFlight > 0 {
 		if ctx.Err() != nil {
-			scan.Status = "cancelled"
-			scan.FinishedAt = time.Now()
-			scan.Error = "scan cancelled"
-			_ = s.store.UpdateScan(scan)
-			s.publish(Event{Type: "complete", ScanID: scan.ID, Message: "Scan cancelled", Data: scan})
+			s.cancelScan(scan, jobs)
 			close(jobs)
 			return
 		}
@@ -214,38 +232,119 @@ func (s *Service) runScan(ctx context.Context, scan ScanSummary, root *url.URL, 
 		case page := <-results:
 			inFlight--
 			scan.CompletedPages++
-			if page.FetchError != "" || page.AuditError != "" {
+			scan.FastCompletedPages = scan.CompletedPages
+			if page.FetchError != "" {
 				scan.FailedPages++
 			}
-			rollup.Add(page.Lighthouse)
-			scan.Scores = rollup.ScoreSet()
+			page.AuditStatus = "pending"
+			page = NormalizePage(page)
+			analyzedPages = append(analyzedPages, page)
 			_ = s.store.SavePage(scan.ID, page)
 			_ = s.store.UpdateScan(scan)
-			s.publish(Event{Type: "page-complete", ScanID: scan.ID, PageURL: page.URL, Data: page})
+			s.publish(Event{Type: "page-analyzed", ScanID: scan.ID, PageURL: page.URL, Data: page})
 			for _, link := range page.Links {
 				if link.Kind == "internal" {
 					enqueue(link.URL)
 				}
 			}
 		case <-ctx.Done():
-			scan.Status = "cancelled"
-			scan.FinishedAt = time.Now()
-			scan.Error = "scan cancelled"
-			_ = s.store.UpdateScan(scan)
-			s.publish(Event{Type: "complete", ScanID: scan.ID, Message: "Scan cancelled", Data: scan})
+			s.cancelScan(scan, jobs)
 			close(jobs)
 			return
 		}
 	}
 
 	close(jobs)
+	scan.Phase = "fast-complete"
+	_ = s.store.UpdateScan(scan)
+	s.publish(Event{Type: "fast-complete", ScanID: scan.ID, Message: "Fast report ready", Data: scan})
+
+	scan = s.runLighthouseAudits(ctx, scan, analyzedPages, opts)
+	if ctx.Err() != nil {
+		scan.Status = "cancelled"
+		scan.Phase = "cancelled"
+		scan.FinishedAt = time.Now()
+		scan.Error = "scan cancelled"
+		_ = s.store.UpdateScan(scan)
+		s.publish(Event{Type: "complete", ScanID: scan.ID, Message: "Scan cancelled", Data: scan})
+		return
+	}
 	scan.Status = "completed"
+	scan.Phase = "completed"
 	scan.FinishedAt = time.Now()
 	_ = s.store.UpdateScan(scan)
 	s.publish(Event{Type: "complete", ScanID: scan.ID, Message: "Scan completed", Data: scan})
 }
 
-func (s *Service) processPage(ctx context.Context, pageURL string, root *url.URL) PageResult {
+func (s *Service) cancelScan(scan ScanSummary, jobs chan string) {
+	scan.Status = "cancelled"
+	scan.Phase = "cancelled"
+	scan.FinishedAt = time.Now()
+	scan.Error = "scan cancelled"
+	_ = s.store.UpdateScan(scan)
+	s.publish(Event{Type: "complete", ScanID: scan.ID, Message: "Scan cancelled", Data: scan})
+}
+
+func (s *Service) runLighthouseAudits(ctx context.Context, scan ScanSummary, pages []PageResult, opts ScanOptions) ScanSummary {
+	auditPages := selectAuditPages(pages, opts)
+	scan.AuditQueuedPages = len(auditPages)
+	if scan.AuditQueuedPages == 0 {
+		return scan
+	}
+	scan.Phase = "auditing"
+	_ = s.store.UpdateScan(scan)
+
+	rollup := newScoreRollup()
+	for _, page := range auditPages {
+		if ctx.Err() != nil {
+			return scan
+		}
+		page.AuditStatus = "running"
+		page.AuditError = ""
+		_ = s.store.SavePage(scan.ID, page)
+		s.publish(Event{Type: "audit-start", ScanID: scan.ID, PageURL: page.URL, Data: page})
+
+		audited := s.auditPageWithLighthouse(ctx, page)
+		if ctx.Err() != nil {
+			return scan
+		}
+		if audited.AuditStatus == "failed" {
+			scan.AuditFailedPages++
+			s.publish(Event{Type: "audit-error", ScanID: scan.ID, PageURL: audited.URL, Data: audited})
+		} else {
+			scan.AuditCompletedPages++
+			rollup.Add(audited.Lighthouse)
+			scan.Scores = rollup.ScoreSet()
+			s.publish(Event{Type: "audit-complete", ScanID: scan.ID, PageURL: audited.URL, Data: audited})
+		}
+		_ = s.store.SavePage(scan.ID, audited)
+		_ = s.store.UpdateScan(scan)
+	}
+	return scan
+}
+
+func selectAuditPages(pages []PageResult, opts ScanOptions) []PageResult {
+	if opts.LighthouseMode == "none" {
+		return []PageResult{}
+	}
+	limit := opts.LighthouseLimit
+	if limit <= 0 {
+		limit = 5
+	}
+	selected := make([]PageResult, 0, limit)
+	for _, page := range pages {
+		if page.FetchError != "" {
+			continue
+		}
+		selected = append(selected, page)
+		if opts.LighthouseMode == "top" && len(selected) >= limit {
+			break
+		}
+	}
+	return selected
+}
+
+func (s *Service) fetchAndAnalyzePage(ctx context.Context, pageURL string, root *url.URL) PageResult {
 	page := PageResult{URL: pageURL}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
 	if err != nil {
@@ -274,14 +373,21 @@ func (s *Service) processPage(ctx context.Context, pageURL string, root *url.URL
 	for i := range analyzed.Links {
 		analyzed.Links[i].PageURL = pageURL
 	}
+	analyzed.AuditStatus = "pending"
+	return NormalizePage(analyzed)
+}
 
-	scores, err := s.lighthouse.Audit(ctx, pageURL)
+func (s *Service) auditPageWithLighthouse(ctx context.Context, page PageResult) PageResult {
+	scores, err := s.lighthouse.Audit(ctx, page.URL)
 	if err != nil {
-		analyzed.AuditError = err.Error()
+		page.AuditError = err.Error()
+		page.AuditStatus = "failed"
 	} else {
-		analyzed.Lighthouse = scores
+		page.Lighthouse = scores
+		page.AuditStatus = "complete"
+		page.AuditError = ""
 	}
-	return analyzed
+	return NormalizePage(page)
 }
 
 func (s *Service) publish(event Event) {

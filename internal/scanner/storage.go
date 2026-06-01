@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -33,6 +34,7 @@ func OpenSQLiteStore(path string) (*SQLiteStore, error) {
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
 	store := &SQLiteStore{db: db}
 	if err := store.init(); err != nil {
 		db.Close()
@@ -52,11 +54,16 @@ CREATE TABLE IF NOT EXISTS scans (
   input_url TEXT NOT NULL,
   root_url TEXT NOT NULL,
   status TEXT NOT NULL,
+  phase TEXT NOT NULL DEFAULT '',
   started_at TEXT NOT NULL,
   finished_at TEXT,
   discovered_pages INTEGER NOT NULL DEFAULT 0,
   completed_pages INTEGER NOT NULL DEFAULT 0,
   failed_pages INTEGER NOT NULL DEFAULT 0,
+  fast_completed_pages INTEGER NOT NULL DEFAULT 0,
+  audit_queued_pages INTEGER NOT NULL DEFAULT 0,
+  audit_completed_pages INTEGER NOT NULL DEFAULT 0,
+  audit_failed_pages INTEGER NOT NULL DEFAULT 0,
   performance REAL,
   accessibility REAL,
   best_practices REAL,
@@ -89,19 +96,41 @@ CREATE TABLE IF NOT EXISTS pages (
   best_practices REAL,
   seo REAL,
   health REAL,
+  audit_status TEXT NOT NULL DEFAULT '',
   audit_error TEXT,
   fetch_error TEXT,
   UNIQUE(scan_id, url)
 );`)
-	return err
+	if err != nil {
+		return err
+	}
+	for _, column := range []struct {
+		table string
+		name  string
+		def   string
+	}{
+		{"scans", "phase", "TEXT NOT NULL DEFAULT ''"},
+		{"scans", "fast_completed_pages", "INTEGER NOT NULL DEFAULT 0"},
+		{"scans", "audit_queued_pages", "INTEGER NOT NULL DEFAULT 0"},
+		{"scans", "audit_completed_pages", "INTEGER NOT NULL DEFAULT 0"},
+		{"scans", "audit_failed_pages", "INTEGER NOT NULL DEFAULT 0"},
+		{"pages", "audit_status", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := s.ensureColumn(column.table, column.name, column.def); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *SQLiteStore) CreateScan(scan ScanSummary) error {
 	_, err := s.db.Exec(`
-INSERT INTO scans (id, input_url, root_url, status, started_at, discovered_pages, completed_pages, failed_pages, performance, accessibility, best_practices, seo, health, error)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		scan.ID, scan.InputURL, scan.RootURL, scan.Status, scan.StartedAt.Format(time.RFC3339Nano),
-		scan.DiscoveredPages, scan.CompletedPages, scan.FailedPages,
+INSERT INTO scans (id, input_url, root_url, status, phase, started_at, discovered_pages, completed_pages, failed_pages,
+  fast_completed_pages, audit_queued_pages, audit_completed_pages, audit_failed_pages, performance, accessibility, best_practices, seo, health, error)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		scan.ID, scan.InputURL, scan.RootURL, scan.Status, scan.Phase, scan.StartedAt.Format(time.RFC3339Nano),
+		scan.DiscoveredPages, scan.CompletedPages, scan.FailedPages, scan.FastCompletedPages,
+		scan.AuditQueuedPages, scan.AuditCompletedPages, scan.AuditFailedPages,
 		nullable(scan.Scores.Performance), nullable(scan.Scores.Accessibility), nullable(scan.Scores.BestPractices), nullable(scan.Scores.SEO), nullable(scan.Scores.Health),
 		scan.Error)
 	return err
@@ -114,16 +143,19 @@ func (s *SQLiteStore) UpdateScan(scan ScanSummary) error {
 	}
 	_, err := s.db.Exec(`
 UPDATE scans
-SET status = ?, finished_at = ?, discovered_pages = ?, completed_pages = ?, failed_pages = ?,
+SET status = ?, phase = ?, finished_at = ?, discovered_pages = ?, completed_pages = ?, failed_pages = ?,
+    fast_completed_pages = ?, audit_queued_pages = ?, audit_completed_pages = ?, audit_failed_pages = ?,
     performance = ?, accessibility = ?, best_practices = ?, seo = ?, health = ?, error = ?
 WHERE id = ?`,
-		scan.Status, finished, scan.DiscoveredPages, scan.CompletedPages, scan.FailedPages,
+		scan.Status, scan.Phase, finished, scan.DiscoveredPages, scan.CompletedPages, scan.FailedPages,
+		scan.FastCompletedPages, scan.AuditQueuedPages, scan.AuditCompletedPages, scan.AuditFailedPages,
 		nullable(scan.Scores.Performance), nullable(scan.Scores.Accessibility), nullable(scan.Scores.BestPractices), nullable(scan.Scores.SEO), nullable(scan.Scores.Health),
 		scan.Error, scan.ID)
 	return err
 }
 
 func (s *SQLiteStore) SavePage(scanID string, page PageResult) error {
+	page = NormalizePage(page)
 	og, _ := json.Marshal(page.OG)
 	links, _ := json.Marshal(page.Links)
 	blocks, _ := json.Marshal(page.Blocks)
@@ -132,9 +164,9 @@ func (s *SQLiteStore) SavePage(scanID string, page PageResult) error {
 INSERT INTO pages (
   scan_id, url, status_code, title, h1, canonical, description, robots, lang,
   og_json, links_json, blocks_json, sections_json, block_count, section_count, link_count,
-  internal_links, external_links, performance, accessibility, best_practices, seo, health,
+  internal_links, external_links, performance, accessibility, best_practices, seo, health, audit_status,
   audit_error, fetch_error
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(scan_id, url) DO UPDATE SET
   status_code=excluded.status_code, title=excluded.title, h1=excluded.h1, canonical=excluded.canonical,
   description=excluded.description, robots=excluded.robots, lang=excluded.lang, og_json=excluded.og_json,
@@ -142,24 +174,24 @@ ON CONFLICT(scan_id, url) DO UPDATE SET
   block_count=excluded.block_count, section_count=excluded.section_count, link_count=excluded.link_count,
   internal_links=excluded.internal_links, external_links=excluded.external_links, performance=excluded.performance,
   accessibility=excluded.accessibility, best_practices=excluded.best_practices, seo=excluded.seo,
-  health=excluded.health, audit_error=excluded.audit_error, fetch_error=excluded.fetch_error`,
+  health=excluded.health, audit_status=excluded.audit_status, audit_error=excluded.audit_error, fetch_error=excluded.fetch_error`,
 		scanID, page.URL, page.StatusCode, page.Title, page.H1, page.Canonical, page.Description, page.Robots, page.Lang,
 		string(og), string(links), string(blocks), string(sections), page.BlockCount, page.SectionCount, page.LinkCount,
 		page.InternalLinks, page.ExternalLinks, nullable(page.Lighthouse.Performance), nullable(page.Lighthouse.Accessibility),
 		nullable(page.Lighthouse.BestPractices), nullable(page.Lighthouse.SEO), nullable(page.Lighthouse.Health),
-		page.AuditError, page.FetchError)
+		page.AuditStatus, page.AuditError, page.FetchError)
 	return err
 }
 
 func (s *SQLiteStore) ListScans() ([]ScanSummary, error) {
 	rows, err := s.db.Query(`
-SELECT id, input_url, root_url, status, started_at, COALESCE(finished_at, ''), discovered_pages, completed_pages, failed_pages,
+SELECT id, input_url, root_url, status, COALESCE(phase, ''), started_at, COALESCE(finished_at, ''), discovered_pages, completed_pages, failed_pages,
+       fast_completed_pages, audit_queued_pages, audit_completed_pages, audit_failed_pages,
        performance, accessibility, best_practices, seo, health, COALESCE(error, '')
 FROM scans ORDER BY started_at DESC LIMIT 50`)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
 	scans := []ScanSummary{}
 	for rows.Next() {
@@ -169,12 +201,25 @@ FROM scans ORDER BY started_at DESC LIMIT 50`)
 		}
 		scans = append(scans, scan)
 	}
-	return scans, rows.Err()
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for i := range scans {
+		if err := s.recomputeStoredSummary(&scans[i]); err != nil {
+			return nil, err
+		}
+	}
+	return scans, nil
 }
 
 func (s *SQLiteStore) GetScan(id string) (ScanResult, error) {
 	row := s.db.QueryRow(`
-SELECT id, input_url, root_url, status, started_at, COALESCE(finished_at, ''), discovered_pages, completed_pages, failed_pages,
+SELECT id, input_url, root_url, status, COALESCE(phase, ''), started_at, COALESCE(finished_at, ''), discovered_pages, completed_pages, failed_pages,
+       fast_completed_pages, audit_queued_pages, audit_completed_pages, audit_failed_pages,
        performance, accessibility, best_practices, seo, health, COALESCE(error, '')
 FROM scans WHERE id = ?`, id)
 	summary, err := scanFromRows(row)
@@ -189,7 +234,7 @@ FROM scans WHERE id = ?`, id)
 SELECT url, status_code, COALESCE(title, ''), COALESCE(h1, ''), COALESCE(canonical, ''), COALESCE(description, ''),
        COALESCE(robots, ''), COALESCE(lang, ''), og_json, links_json, blocks_json, sections_json,
        block_count, section_count, link_count, internal_links, external_links,
-       performance, accessibility, best_practices, seo, health, COALESCE(audit_error, ''), COALESCE(fetch_error, '')
+       performance, accessibility, best_practices, seo, health, COALESCE(audit_status, ''), COALESCE(audit_error, ''), COALESCE(fetch_error, '')
 FROM pages WHERE scan_id = ? ORDER BY url`, id)
 	if err != nil {
 		return ScanResult{}, err
@@ -213,8 +258,9 @@ FROM pages WHERE scan_id = ? ORDER BY url`, id)
 	if err := rows.Err(); err != nil {
 		return ScanResult{}, err
 	}
+	result.Summary = recomputeSummaryFromPages(result.Summary, result.Pages)
 	result.Blocks, result.Sections, result.Links, result.SEO = aggregate(result.Pages)
-	return result, nil
+	return NormalizeScanResult(result), nil
 }
 
 type scannerRows interface {
@@ -225,10 +271,17 @@ func scanFromRows(row scannerRows) (ScanSummary, error) {
 	var scan ScanSummary
 	var startedAt, finishedAt string
 	var performance, accessibility, bestPractices, seo, health sql.NullFloat64
-	if err := row.Scan(&scan.ID, &scan.InputURL, &scan.RootURL, &scan.Status, &startedAt, &finishedAt,
+	if err := row.Scan(&scan.ID, &scan.InputURL, &scan.RootURL, &scan.Status, &scan.Phase, &startedAt, &finishedAt,
 		&scan.DiscoveredPages, &scan.CompletedPages, &scan.FailedPages,
+		&scan.FastCompletedPages, &scan.AuditQueuedPages, &scan.AuditCompletedPages, &scan.AuditFailedPages,
 		&performance, &accessibility, &bestPractices, &seo, &health, &scan.Error); err != nil {
 		return scan, err
+	}
+	if scan.Phase == "" {
+		scan.Phase = scan.Status
+	}
+	if scan.FastCompletedPages == 0 && scan.CompletedPages > 0 {
+		scan.FastCompletedPages = scan.CompletedPages
 	}
 	scan.StartedAt = parseTime(startedAt)
 	if finishedAt != "" {
@@ -251,7 +304,7 @@ func pageFromRows(rows *sql.Rows) (PageResult, error) {
 	err := rows.Scan(&page.URL, &page.StatusCode, &page.Title, &page.H1, &page.Canonical, &page.Description,
 		&page.Robots, &page.Lang, &ogJSON, &linksJSON, &blocksJSON, &sectionsJSON,
 		&page.BlockCount, &page.SectionCount, &page.LinkCount, &page.InternalLinks, &page.ExternalLinks,
-		&performance, &accessibility, &bestPractices, &seo, &health, &page.AuditError, &page.FetchError)
+		&performance, &accessibility, &bestPractices, &seo, &health, &page.AuditStatus, &page.AuditError, &page.FetchError)
 	if err != nil {
 		return page, err
 	}
@@ -266,7 +319,7 @@ func pageFromRows(rows *sql.Rows) (PageResult, error) {
 		SEO:           fromNull(seo),
 		Health:        fromNull(health),
 	}
-	return page, nil
+	return NormalizePage(page), nil
 }
 
 func aggregate(pages []PageResult) ([]BlockStat, []SectionStat, LinkStats, SEOStats) {
@@ -348,7 +401,7 @@ func aggregate(pages []PageResult) ([]BlockStat, []SectionStat, LinkStats, SEOSt
 		}
 	}
 
-	var blocks []BlockStat
+	blocks := []BlockStat{}
 	for name, stat := range blockMap {
 		stat.Pages = sortedSet(blockPages[name])
 		blocks = append(blocks, *stat)
@@ -360,7 +413,7 @@ func aggregate(pages []PageResult) ([]BlockStat, []SectionStat, LinkStats, SEOSt
 		return blocks[i].Count > blocks[j].Count
 	})
 
-	var sections []SectionStat
+	sections := []SectionStat{}
 	for variation, stat := range sectionMap {
 		stat.Pages = sortedSet(sectionPages[variation])
 		sections = append(sections, *stat)
@@ -375,6 +428,99 @@ func aggregate(pages []PageResult) ([]BlockStat, []SectionStat, LinkStats, SEOSt
 	links.UniqueInternal = len(internalUnique)
 	links.UniqueExternal = len(externalUnique)
 	return blocks, sections, links, seo
+}
+
+func (s *SQLiteStore) recomputeStoredSummary(scan *ScanSummary) error {
+	rows, err := s.db.Query(`
+SELECT COALESCE(fetch_error, ''), COALESCE(audit_status, ''), COALESCE(audit_error, ''), health
+FROM pages WHERE scan_id = ?`, scan.ID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	pages := []PageResult{}
+	for rows.Next() {
+		var page PageResult
+		var health sql.NullFloat64
+		if err := rows.Scan(&page.FetchError, &page.AuditStatus, &page.AuditError, &health); err != nil {
+			return err
+		}
+		page.Lighthouse.Health = fromNull(health)
+		pages = append(pages, NormalizePage(page))
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	*scan = recomputeSummaryFromPages(*scan, pages)
+	return nil
+}
+
+func recomputeSummaryFromPages(scan ScanSummary, pages []PageResult) ScanSummary {
+	if len(pages) == 0 {
+		return scan
+	}
+	scan.CompletedPages = len(pages)
+	scan.FastCompletedPages = len(pages)
+	scan.FailedPages = 0
+	audited := 0
+	auditCompleted := 0
+	auditFailed := 0
+	for _, page := range pages {
+		page = NormalizePage(page)
+		if page.FetchError != "" {
+			scan.FailedPages++
+		}
+		if page.AuditStatus == "complete" || page.AuditStatus == "failed" || page.AuditStatus == "running" {
+			audited++
+		}
+		if page.AuditStatus == "complete" {
+			auditCompleted++
+		}
+		if page.AuditStatus == "failed" {
+			auditFailed++
+		}
+	}
+	if scan.AuditQueuedPages == 0 && audited > 0 {
+		scan.AuditQueuedPages = audited
+	}
+	if scan.Status != "running" {
+		scan.AuditCompletedPages = auditCompleted
+		scan.AuditFailedPages = auditFailed
+		return scan
+	}
+	if scan.AuditCompletedPages == 0 && auditCompleted > 0 {
+		scan.AuditCompletedPages = auditCompleted
+	}
+	if scan.AuditFailedPages == 0 && auditFailed > 0 {
+		scan.AuditFailedPages = auditFailed
+	}
+	return scan
+}
+
+func (s *SQLiteStore) ensureColumn(table, column, definition string) error {
+	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if strings.EqualFold(name, column) {
+			return rows.Err()
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition)
+	return err
 }
 
 func nullable(value *float64) any {

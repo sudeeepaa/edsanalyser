@@ -50,11 +50,23 @@ export default function App() {
       return undefined;
     }
     const source = new EventSource(`/api/scans/${activeScan.id}/events`);
-    const eventNames = ['start', 'discovered', 'warning', 'page-start', 'page-complete', 'cancel', 'complete'];
+    const eventNames = [
+      'start',
+      'discovered',
+      'warning',
+      'page-start',
+      'page-analyzed',
+      'fast-complete',
+      'audit-start',
+      'audit-complete',
+      'audit-error',
+      'cancel',
+      'complete',
+    ];
     const handleEvent = (message: MessageEvent) => {
       const parsed = JSON.parse(message.data) as ScanEvent;
       setEvents((current) => [parsed, ...current].slice(0, 8));
-      if (parsed.type === 'page-complete' || parsed.type === 'complete' || parsed.type === 'discovered') {
+      if (['page-analyzed', 'fast-complete', 'audit-start', 'audit-complete', 'audit-error', 'complete', 'discovered'].includes(parsed.type)) {
         void loadScan(activeScan.id);
       }
       if (parsed.type === 'complete') {
@@ -211,11 +223,11 @@ export default function App() {
 
         {summary && (
           <section className="progress-band">
-            <Metric label="Health" value={formatScore(summary.scores.health)} tone={scoreTone(summary.scores.health)} />
-            <Metric label="Pages" value={`${summary.completedPages}/${summary.discoveredPages}`} />
+            <Metric label="Phase" value={phaseLabel(summary)} />
+            <Metric label="Fast pages" value={`${summary.fastCompletedPages}/${summary.discoveredPages}`} />
             <Metric label="Failures" value={summary.failedPages.toString()} tone={summary.failedPages ? 'warn' : 'good'} />
-            <Metric label="Performance" value={formatScore(summary.scores.performance)} tone={scoreTone(summary.scores.performance)} />
-            <Metric label="SEO" value={formatScore(summary.scores.seo)} tone={scoreTone(summary.scores.seo)} />
+            <Metric label="Audits" value={`${summary.auditCompletedPages}/${summary.auditQueuedPages}`} />
+            <Metric label="Health" value={formatScore(summary.scores.health)} tone={scoreTone(summary.scores.health)} />
           </section>
         )}
 
@@ -253,36 +265,37 @@ export default function App() {
 
 function Overview({ scan }: { scan: ScanResult }) {
   const totals = [
-    { label: 'Blocks', value: scan.pages.reduce((sum, page) => sum + page.blockCount, 0) },
+    { label: 'Pages analyzed', value: scan.summary.fastCompletedPages || scan.pages.length },
+    { label: 'Blocks used', value: scan.pages.reduce((sum, page) => sum + page.blockCount, 0) },
     { label: 'Block types', value: scan.blocks.length },
     { label: 'Section variations', value: scan.sections.length },
     { label: 'Links', value: scan.links.total },
-    { label: 'Missing titles', value: scan.seo.missingTitle },
     { label: 'Missing OG images', value: scan.seo.missingOgImage },
   ];
   return (
     <section className="content-grid">
-      <div className="panel wide">
-        <div className="panel-heading">
-          <h2>Lighthouse</h2>
-          <BarChart3 size={19} />
-        </div>
-        <div className="score-grid">
-          <ScoreGauge label="Performance" score={scan.summary.scores.performance} />
-          <ScoreGauge label="Accessibility" score={scan.summary.scores.accessibility} />
-          <ScoreGauge label="Best Practices" score={scan.summary.scores.bestPractices} />
-          <ScoreGauge label="SEO" score={scan.summary.scores.seo} />
-        </div>
-      </div>
       <div className="panel">
         <div className="panel-heading">
-          <h2>Inventory</h2>
+          <h2>Fast EDS report</h2>
           <Boxes size={19} />
         </div>
         <div className="stat-list">
           {totals.map((item) => (
             <Metric key={item.label} label={item.label} value={item.value.toString()} />
           ))}
+        </div>
+      </div>
+      <div className="panel wide">
+        <div className="panel-heading">
+          <h2>Lighthouse</h2>
+          <BarChart3 size={19} />
+        </div>
+        <p className="panel-note">{lighthouseLabel(scan.summary)}</p>
+        <div className="score-grid">
+          <ScoreGauge label="Performance" score={scan.summary.scores.performance} />
+          <ScoreGauge label="Accessibility" score={scan.summary.scores.accessibility} />
+          <ScoreGauge label="Best Practices" score={scan.summary.scores.bestPractices} />
+          <ScoreGauge label="SEO" score={scan.summary.scores.seo} />
         </div>
       </div>
     </section>
@@ -319,6 +332,7 @@ function PagesView({
                 <th>URL</th>
                 <th>Title</th>
                 <th>Health</th>
+                <th>Audit</th>
                 <th>Blocks</th>
                 <th>Links</th>
               </tr>
@@ -329,10 +343,12 @@ function PagesView({
                   <td>{compactURL(page.url)}</td>
                   <td>{page.title || 'Missing title'}</td>
                   <td><ScoreBadge score={page.lighthouse.health} /></td>
+                  <td><span className={`audit-status ${page.auditStatus}`}>{page.auditStatus}</span></td>
                   <td>{page.blockCount}</td>
                   <td>{page.linkCount}</td>
                 </tr>
               ))}
+              {pages.length === 0 && <EmptyTableRow columns={6} message="No pages analyzed yet" />}
             </tbody>
           </table>
         </div>
@@ -358,6 +374,7 @@ function PageDetail({ page }: { page: PageResult | null }) {
         <dt>Title</dt><dd>{page.title || 'Missing'}</dd>
         <dt>H1</dt><dd>{page.h1 || 'Missing'}</dd>
         <dt>Status</dt><dd>{page.statusCode || 'n/a'}</dd>
+        <dt>Audit</dt><dd><span className={`audit-status ${page.auditStatus}`}>{page.auditStatus}</span></dd>
         <dt>Canonical</dt><dd>{page.canonical || 'Missing'}</dd>
         <dt>Description</dt><dd>{page.description || 'Missing'}</dd>
         <dt>OG title</dt><dd>{page.og.title || 'Missing'}</dd>
@@ -379,6 +396,7 @@ function PageDetail({ page }: { page: PageResult | null }) {
         {page.blocks.map((block, index) => (
           <span key={`${block.name}-${index}`} className="chip">{block.name}{block.variations.length ? ` / ${block.variations.join(', ')}` : ''}</span>
         ))}
+        {page.blocks.length === 0 && <span className="muted-text">No blocks found</span>}
       </div>
       <h3>Links</h3>
       <div className="link-list">
@@ -388,6 +406,7 @@ function PageDetail({ page }: { page: PageResult | null }) {
             {link.text || compactURL(link.url)}
           </a>
         ))}
+        {page.links.length === 0 && <span className="muted-text">No links found</span>}
       </div>
     </div>
   );
@@ -445,6 +464,7 @@ function LinksView({ scan }: { scan: ScanResult }) {
                   <td>{link.pageUrl ? compactURL(link.pageUrl) : '-'}</td>
                 </tr>
               ))}
+              {allLinks.length === 0 && <EmptyTableRow columns={4} message="No links found yet" />}
             </tbody>
           </table>
         </div>
@@ -481,6 +501,7 @@ function SEOView({ scan }: { scan: ScanResult }) {
                   <td>{page.og.url ? compactURL(page.og.url) : 'Missing'}</td>
                 </tr>
               ))}
+              {scan.pages.length === 0 && <EmptyTableRow columns={4} message="No pages analyzed yet" />}
             </tbody>
           </table>
         </div>
@@ -495,17 +516,19 @@ function HistoryView({ history, currentID, onOpen }: { history: ScanSummary[]; c
       <div className="panel-heading"><h2>History</h2><History size={19} /></div>
       <div className="table-scroll">
         <table>
-          <thead><tr><th>Site</th><th>Status</th><th>Pages</th><th>Health</th><th>Started</th></tr></thead>
+          <thead><tr><th>Site</th><th>Phase</th><th>Pages</th><th>Audits</th><th>Health</th><th>Started</th></tr></thead>
           <tbody>
             {history.map((item) => (
               <tr key={item.id} onClick={() => onOpen(item.id)} className={item.id === currentID ? 'selected' : ''}>
                 <td>{readableHost(item.rootUrl)}</td>
-                <td>{item.status}</td>
-                <td>{item.completedPages}/{item.discoveredPages}</td>
+                <td>{phaseLabel(item)}</td>
+                <td>{item.fastCompletedPages}/{item.discoveredPages}</td>
+                <td>{item.auditCompletedPages}/{item.auditQueuedPages}</td>
                 <td><ScoreBadge score={item.scores.health} /></td>
                 <td>{new Date(item.startedAt).toLocaleString()}</td>
               </tr>
             ))}
+            {history.length === 0 && <EmptyTableRow columns={6} message="No scans yet" />}
           </tbody>
         </table>
       </div>
@@ -545,10 +568,19 @@ function StatTable({ title, rows }: { title: string; rows: Array<{ name: string;
                 <td>{row.detail}</td>
               </tr>
             ))}
+            {rows.length === 0 && <EmptyTableRow columns={3} message="No data yet" />}
           </tbody>
         </table>
       </div>
     </div>
+  );
+}
+
+function EmptyTableRow({ columns, message }: { columns: number; message: string }) {
+  return (
+    <tr>
+      <td colSpan={columns} className="empty-cell">{message}</td>
+    </tr>
   );
 }
 
@@ -576,6 +608,38 @@ function ScoreGauge({ label, score }: { label: string; score: number | null }) {
 
 function ScoreBadge({ score }: { score: number | null }) {
   return <span className={`score-badge ${scoreTone(score)}`}>{formatScore(score)}</span>;
+}
+
+function phaseLabel(summary: ScanSummary) {
+  switch (summary.phase || summary.status) {
+    case 'discovering':
+      return 'Discovering';
+    case 'analyzing':
+      return 'Analyzing pages';
+    case 'fast-complete':
+      return 'Fast report ready';
+    case 'auditing':
+      return 'Auditing top 5';
+    case 'completed':
+      return 'Complete';
+    case 'cancelled':
+      return 'Cancelled';
+    default:
+      return summary.status || 'Idle';
+  }
+}
+
+function lighthouseLabel(summary: ScanSummary) {
+  if (summary.auditQueuedPages === 0 && summary.phase !== 'completed') {
+    return 'Lighthouse starts after the fast report is ready.';
+  }
+  if (summary.phase === 'auditing') {
+    return `Auditing ${summary.auditCompletedPages}/${summary.auditQueuedPages} top pages.`;
+  }
+  if (summary.auditQueuedPages > 0) {
+    return `Audited ${summary.auditCompletedPages}/${summary.auditQueuedPages} top pages.`;
+  }
+  return 'No Lighthouse audits queued.';
 }
 
 function formatScore(score: number | null | undefined) {

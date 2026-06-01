@@ -59,7 +59,75 @@ describe('App', () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/scans', expect.objectContaining({ method: 'POST' })));
     expect(await screen.findByText('example.com')).toBeInTheDocument();
   });
+
+  it('renders old scan data with null nested arrays without blanking tabs', async () => {
+    const summary = scanSummary('scan-null');
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([summary]))
+      .mockResolvedValueOnce(jsonResponse({
+        summary,
+        pages: [{
+          url: 'https://example.com/',
+          statusCode: 200,
+          title: 'Home',
+          h1: '',
+          canonical: '',
+          description: '',
+          robots: '',
+          lang: '',
+          og: { title: 'Home', description: '', image: '', url: '', type: '', siteName: '' },
+          links: null,
+          blocks: null,
+          sections: null,
+          blockCount: 0,
+          sectionCount: 0,
+          linkCount: 0,
+          internalLinks: 0,
+          externalLinks: 0,
+          lighthouse: { performance: null, accessibility: null, bestPractices: null, seo: null, health: null },
+          auditStatus: '',
+        }],
+        blocks: null,
+        sections: null,
+        links: null,
+        seo: null,
+        generatedAt: new Date().toISOString(),
+      }));
+
+    render(<App />);
+    await userEvent.click(await screen.findByText('example.com'));
+    await userEvent.click(screen.getByRole('button', { name: 'Pages' }));
+    expect(await screen.findByText('No links found')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Blocks' }));
+    expect((await screen.findAllByText('No data yet')).length).toBeGreaterThan(0);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Links' }));
+    expect(await screen.findByText('No links found yet')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'SEO / OG' }));
+    expect(await screen.findByText('Home')).toBeInTheDocument();
+  });
 });
+
+function scanSummary(id: string) {
+  return {
+    id,
+    inputUrl: 'https://example.com',
+    rootUrl: 'https://example.com/',
+    status: 'completed',
+    phase: 'completed',
+    startedAt: new Date().toISOString(),
+    discoveredPages: 1,
+    completedPages: 1,
+    failedPages: 0,
+    fastCompletedPages: 1,
+    auditQueuedPages: 0,
+    auditCompletedPages: 0,
+    auditFailedPages: 0,
+    scores: { performance: null, accessibility: null, bestPractices: null, seo: null, health: null },
+  };
+}
 
 function jsonResponse(payload: unknown) {
   return {

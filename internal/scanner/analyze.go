@@ -49,24 +49,24 @@ func AnalyzeHTML(pageURL string, body io.Reader, root *url.URL) (PageResult, err
 	page.Sections, page.Blocks = extractEDS(doc)
 	page.SectionCount = len(page.Sections)
 	page.BlockCount = len(page.Blocks)
-	return page, nil
+	return NormalizePage(page), nil
 }
 
 func extractEDS(doc *html.Node) ([]SectionInfo, []BlockInfo) {
 	main := findFirst(doc, "main")
 	if main == nil {
-		return nil, nil
+		return []SectionInfo{}, []BlockInfo{}
 	}
 
-	var sections []SectionInfo
-	var blocks []BlockInfo
+	sections := []SectionInfo{}
+	blocks := []BlockInfo{}
 	sectionIndex := 0
 	for child := main.FirstChild; child != nil; child = child.NextSibling {
 		if !isElement(child, "div") {
 			continue
 		}
 		sectionIndex++
-		section := SectionInfo{Index: sectionIndex}
+		section := SectionInfo{Index: sectionIndex, Variations: []string{}, Blocks: []string{}}
 		variations := make(map[string]bool)
 		for _, className := range classList(child) {
 			if className != "section" {
@@ -89,7 +89,7 @@ func extractEDS(doc *html.Node) ([]SectionInfo, []BlockInfo) {
 				continue
 			}
 			name := classes[0]
-			var blockVariations []string
+			blockVariations := []string{}
 			for _, variation := range classes[1:] {
 				if variation != "" && variation != "block" {
 					blockVariations = append(blockVariations, variation)
@@ -156,7 +156,7 @@ func directChildTexts(n *html.Node) []string {
 }
 
 func extractLinks(doc *html.Node, pageBase *url.URL, root *url.URL) []LinkInfo {
-	var links []LinkInfo
+	links := []LinkInfo{}
 	walk(doc, func(n *html.Node) {
 		if !isElement(n, "a") {
 			return

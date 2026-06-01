@@ -44,14 +44,24 @@ func (s *Server) scans(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, scans)
 	case http.MethodPost:
 		var body struct {
-			URL        string `json:"url"`
-			AuditLimit *int   `json:"auditLimit"`
+			URL             string `json:"url"`
+			AuditLimit      *int   `json:"auditLimit"`
+			LighthouseMode  string `json:"lighthouseMode"`
+			LighthouseLimit *int   `json:"lighthouseLimit"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		scan, err := s.service.StartScan(r.Context(), body.URL, body.AuditLimit)
+		opts := scanner.DefaultScanOptions()
+		opts.CrawlLimit = body.AuditLimit
+		if body.LighthouseMode != "" {
+			opts.LighthouseMode = body.LighthouseMode
+		}
+		if body.LighthouseLimit != nil {
+			opts.LighthouseLimit = *body.LighthouseLimit
+		}
+		scan, err := s.service.StartScan(r.Context(), body.URL, opts)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return

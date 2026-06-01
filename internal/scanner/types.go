@@ -11,17 +11,22 @@ type ScoreSet struct {
 }
 
 type ScanSummary struct {
-	ID              string    `json:"id"`
-	InputURL        string    `json:"inputUrl"`
-	RootURL         string    `json:"rootUrl"`
-	Status          string    `json:"status"`
-	StartedAt       time.Time `json:"startedAt"`
-	FinishedAt      time.Time `json:"finishedAt,omitempty"`
-	DiscoveredPages int       `json:"discoveredPages"`
-	CompletedPages  int       `json:"completedPages"`
-	FailedPages     int       `json:"failedPages"`
-	Scores          ScoreSet  `json:"scores"`
-	Error           string    `json:"error,omitempty"`
+	ID                  string    `json:"id"`
+	InputURL            string    `json:"inputUrl"`
+	RootURL             string    `json:"rootUrl"`
+	Status              string    `json:"status"`
+	Phase               string    `json:"phase"`
+	StartedAt           time.Time `json:"startedAt"`
+	FinishedAt          time.Time `json:"finishedAt,omitempty"`
+	DiscoveredPages     int       `json:"discoveredPages"`
+	CompletedPages      int       `json:"completedPages"`
+	FailedPages         int       `json:"failedPages"`
+	FastCompletedPages  int       `json:"fastCompletedPages"`
+	AuditQueuedPages    int       `json:"auditQueuedPages"`
+	AuditCompletedPages int       `json:"auditCompletedPages"`
+	AuditFailedPages    int       `json:"auditFailedPages"`
+	Scores              ScoreSet  `json:"scores"`
+	Error               string    `json:"error,omitempty"`
 }
 
 type ScanResult struct {
@@ -53,6 +58,7 @@ type PageResult struct {
 	InternalLinks int           `json:"internalLinks"`
 	ExternalLinks int           `json:"externalLinks"`
 	Lighthouse    ScoreSet      `json:"lighthouse"`
+	AuditStatus   string        `json:"auditStatus"`
 	AuditError    string        `json:"auditError,omitempty"`
 	FetchError    string        `json:"fetchError,omitempty"`
 }

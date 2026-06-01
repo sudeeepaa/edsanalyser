@@ -13,11 +13,16 @@ export interface ScanSummary {
   inputUrl: string;
   rootUrl: string;
   status: string;
+  phase: string;
   startedAt: string;
   finishedAt?: string;
   discoveredPages: number;
   completedPages: number;
   failedPages: number;
+  fastCompletedPages: number;
+  auditQueuedPages: number;
+  auditCompletedPages: number;
+  auditFailedPages: number;
   scores: ScoreSet;
   error?: string;
 }
@@ -74,6 +79,7 @@ export interface PageResult {
   internalLinks: number;
   externalLinks: number;
   lighthouse: ScoreSet;
+  auditStatus: 'pending' | 'running' | 'complete' | 'failed' | string;
   auditError?: string;
   fetchError?: string;
 }
@@ -131,4 +137,3 @@ export interface ScanEvent {
   data?: unknown;
   timestamp: string;
 }
-
