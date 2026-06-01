@@ -1,0 +1,31 @@
+{
+  "name": "eds-analyser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --config vite.config.mjs --host 0.0.0.0",
+    "build": "tsc --noEmit && vite build --config vite.config.mjs",
+    "preview": "vite preview --config vite.config.mjs --host 0.0.0.0",
+    "test": "vitest run --config vitest.config.mjs",
+    "server": "go run ./cmd/server"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.1.0",
+    "@testing-library/user-event": "^14.5.2",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^25.0.1",
+    "lighthouse": "^12.3.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "vitest": "^2.1.8"
+  }
+}
